@@ -1,4 +1,4 @@
-PyQt5==5.15.7
+PyQt5==5.15.11
 opencv-python==4.6.0.66
 scikit-image==0.19.3
 scipy==1.9.1
