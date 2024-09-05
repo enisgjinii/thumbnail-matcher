@@ -4,4 +4,4 @@ scikit-image==0.19.3
 scipy==1.9.1
 numpy==1.23.3
 yt-dlp==2022.9.1
-google-api-python-client==2.55.0
+google-api-python-client==2.144.0
