@@ -19,8 +19,6 @@ from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 from yt_dlp import YoutubeDL
 from googleapiclient.discovery import build
-# Get youtube api from .env
-
 # YouTube API setup - Replace with your own API key
 YOUTUBE_API_KEY = 'AIzaSyCRFtIfiEyeYmCrCZ8Bvy8Z4IPBy1v2iwo'
 YOUTUBE_API_SERVICE_NAME = 'youtube'
@@ -38,6 +36,8 @@ class VideoDownloader(QThread):
     def __init__(self, url):
         super().__init__()
         self.url = url
+        self.video_path = ""
+        self.thumbnail_path = ""
     def run(self):
         try:
             video_id_match = re.search(r"(?:v=|/v/|/vi/|v%3D|vi%3D)([^&?/\"]{11})", self.url)
@@ -56,13 +56,13 @@ class VideoDownloader(QThread):
             ydl_opts = {'format': 'best', 'outtmpl': f'{video_id}_video.%(ext)s'}
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-            video_path = os.path.join(os.getcwd(), f"{video_id}_video.mp4")
+            self.video_path = os.path.join(os.getcwd(), f"{video_id}_video.mp4")
             self.progress_update.emit("Downloading thumbnail...")
-            thumbnail_path = os.path.join(os.getcwd(), f"{video_id}_thumbnail.jpg")
+            self.thumbnail_path = os.path.join(os.getcwd(), f"{video_id}_thumbnail.jpg")
             response = requests.get(thumbnail_url)
-            with open(thumbnail_path, 'wb') as f:
+            with open(self.thumbnail_path, 'wb') as f:
                 f.write(response.content)
-            self.download_complete.emit(video_path, thumbnail_path)
+            self.download_complete.emit(self.video_path, self.thumbnail_path)
         except Exception as e:
             self.progress_update.emit(f"Error: {str(e)}")
 class VideoThumbnailMatcher(QThread):
@@ -190,6 +190,10 @@ class MainWindow(QMainWindow):
         self.fetch_button.setIcon(QIcon('icons/download.png'))
         self.fetch_button.clicked.connect(self.fetch_youtube_video)
         url_layout.addWidget(self.fetch_button)
+        self.clear_button = QPushButton("Clear All")
+        self.clear_button.setIcon(QIcon('icons/clear.png'))
+        self.clear_button.clicked.connect(self.clear_all)
+        url_layout.addWidget(self.clear_button)
         main_layout.addLayout(url_layout)
         # File selection buttons
         file_layout = QHBoxLayout()
@@ -235,6 +239,14 @@ class MainWindow(QMainWindow):
         self.threshold_label = QLabel("0.90")
         threshold_layout.addWidget(self.threshold_label)
         main_layout.addLayout(threshold_layout)
+        # Similarity grouping dropdown
+        grouping_layout = QHBoxLayout()
+        grouping_layout.addWidget(QLabel("Group by similarity:"))
+        self.grouping_combo = QComboBox()
+        self.grouping_combo.addItems(["All", "More Similar", "Less Similar", "Not Good Similar"])
+        self.grouping_combo.currentIndexChanged.connect(self.update_similar_frames_grid)
+        grouping_layout.addWidget(self.grouping_combo)
+        main_layout.addLayout(grouping_layout)
         # Splitter for result text and thumbnail preview
         splitter = QSplitter(Qt.Horizontal)
         # Result text
@@ -450,24 +462,35 @@ class MainWindow(QMainWindow):
             self.result_text.setText(f"Error: {result['error']}")
             return
         best_frame_number, best_similarity, best_frame_path = result['best_frame']
-        similar_frames = result['similar_frames']
+        self.similar_frames = result['similar_frames']
         best_time = self.format_time(best_frame_number / self.matcher.fps)
         result_text = f"Best frame found at {best_time} with similarity {best_similarity:.4f}\n"
         result_text += f"Best frame saved as: {best_frame_path}\n\n"
         result_text += "Similar frames for human verification:\n"
-        self.similar_frames = similar_frames  # Store for CSV export
         # Set video for playback
         self.video_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.video_path)))
         self.seek_slider.setRange(0, self.video_player.duration())
+        self.update_similar_frames_grid()
+        for frame_number, similarity in self.similar_frames:
+            time = self.format_time(frame_number / self.matcher.fps)
+            result_text += f"Frame at {time} - Similarity: {similarity:.4f}\n"
+        self.result_text.setText(result_text)
+    def update_similar_frames_grid(self):
         # Clear previous grid items
         for i in reversed(range(self.grid_layout.count())): 
             self.grid_layout.itemAt(i).widget().setParent(None)
+        grouping = self.grouping_combo.currentText()
+        filtered_frames = self.similar_frames
+        if grouping == "More Similar":
+            filtered_frames = [f for f in self.similar_frames if f[1] >= 0.5]
+        elif grouping == "Less Similar":
+            filtered_frames = [f for f in self.similar_frames if 0.4 <= f[1] < 0.5]
+        elif grouping == "Not Good Similar":
+            filtered_frames = [f for f in self.similar_frames if f[1] < 0.4]
         row = 0
         col = 0
-        for frame_number, similarity in similar_frames:
+        for frame_number, similarity in filtered_frames:
             time = self.format_time(frame_number / self.matcher.fps)
-            result_text += f"Frame at {time} - Similarity: {similarity:.4f}\n"
-            # Add frame to grid
             frame = self.get_frame(self.video_path, frame_number)
             if frame is not None:
                 frame_widget = self.create_frame_widget(frame, frame_number, time, similarity)
@@ -476,7 +499,6 @@ class MainWindow(QMainWindow):
                 if col == 4:  # 4 columns in the grid
                     col = 0
                     row += 1
-        self.result_text.setText(result_text)
     def format_time(self, seconds):
         minutes, seconds = divmod(int(seconds), 60)
         return f"{minutes:02d}:{seconds:02d}"
@@ -559,7 +581,7 @@ class MainWindow(QMainWindow):
         # Create a sharpening kernel
         kernel = np.array([[-1, -1, -1],
                            [-1,  9, -1],
-                           [-1, -1, -1]])
+                                       [-1, -1, -1]])
         # Apply the sharpening kernel
         sharpened = cv2.filter2D(image, -1, kernel)
         # Blend the sharpened image with the original
@@ -576,6 +598,44 @@ class MainWindow(QMainWindow):
         kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
         enhanced = cv2.filter2D(enhanced, -1, kernel)
         return enhanced
+    def clear_all(self):
+        # Clear video and thumbnail paths
+        self.video_path = ""
+        self.thumbnail_path = ""
+        # Reset button texts
+        self.video_button.setText("Select Video")
+        self.thumbnail_button.setText("Select Thumbnail")
+        # Clear URL input
+        self.url_input.clear()
+        # Clear result text
+        self.result_text.clear()
+        # Reset progress bar
+        self.progress_bar.setValue(0)
+        # Clear thumbnail preview
+        self.thumbnail_preview.clear()
+        # Clear video player
+        self.video_player.setMedia(QMediaContent())
+        # Clear similar frames grid
+        for i in reversed(range(self.grid_layout.count())): 
+            self.grid_layout.itemAt(i).widget().setParent(None)
+        # Delete downloaded files
+        if hasattr(self, 'downloader'):
+            if os.path.exists(self.downloader.video_path):
+                os.remove(self.downloader.video_path)
+            if os.path.exists(self.downloader.thumbnail_path):
+                os.remove(self.downloader.thumbnail_path)
+        # Delete best frame if it exists
+        if hasattr(self, 'matcher'):
+            best_frame_path = os.path.join(os.path.dirname(self.video_path), f"best_frame_{self.matcher.best_frame_number}.jpg")
+            if os.path.exists(best_frame_path):
+                os.remove(best_frame_path)
+        # Reset other attributes
+        self.similar_frames = []
+        if hasattr(self, 'matcher'):
+            del self.matcher
+        if hasattr(self, 'downloader'):
+            del self.downloader
+        QMessageBox.information(self, "Clear All", "All content has been cleared and reset.")
 def main():
     app = QApplication(sys.argv)
     app.setStyle(QStyleFactory.create('Fusion'))
