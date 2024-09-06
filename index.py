@@ -15,10 +15,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog
                              QSlider, QAction, QMenuBar, QMenu)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QUrl
 from PyQt5.QtGui import QPixmap, QImage, QFont, QIcon, QPalette, QColor
-from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from PyQt5.QtMultimediaWidgets import QVideoWidget
 from yt_dlp import YoutubeDL
 from googleapiclient.discovery import build
+from urllib.parse import urlparse, parse_qs
+
 # YouTube API setup - Replace with your own API key
 YOUTUBE_API_KEY = 'AIzaSyCRFtIfiEyeYmCrCZ8Bvy8Z4IPBy1v2iwo'
 YOUTUBE_API_SERVICE_NAME = 'youtube'
@@ -26,6 +26,7 @@ YOUTUBE_API_VERSION = 'v3'
 class YouTubeVideoInfo:
     def __init__(self, api_key):
         self.youtube = build(YOUTUBE_API_SERVICE_NAME, YOUTUBE_API_VERSION, developerKey=api_key)
+
     def get_video_info(self, video_id):
         request = self.youtube.videos().list(part="snippet", id=video_id)
         response = request.execute()
@@ -33,41 +34,86 @@ class YouTubeVideoInfo:
 class VideoDownloader(QThread):
     progress_update = pyqtSignal(str)
     download_complete = pyqtSignal(str, str)
+
     def __init__(self, url):
         super().__init__()
         self.url = url
         self.video_path = ""
         self.thumbnail_path = ""
+
     def run(self):
         try:
-            video_id_match = re.search(r"(?:v=|/v/|/vi/|v%3D|vi%3D)([^&?/\"]{11})", self.url)
-            if not video_id_match:
+            video_id = self.extract_video_id(self.url)
+            if not video_id:
                 self.progress_update.emit("Error: Could not extract video ID from URL.")
                 return
-            video_id = video_id_match.group(1)
+
             yt_info = YouTubeVideoInfo(YOUTUBE_API_KEY)
             video_details = yt_info.get_video_info(video_id)
             if not video_details:
                 self.progress_update.emit("Error: Video not found.")
                 return
+
             video_title = video_details["snippet"]["title"]
             thumbnail_url = video_details["snippet"]["thumbnails"]["high"]["url"]
-            self.progress_update.emit("Downloading video...")
-            ydl_opts = {'format': 'best', 'outtmpl': f'{video_id}_video.%(ext)s'}
+
+            self.progress_update.emit("Downloading high-resolution video without audio...")
+            ydl_opts = {
+                'format': 'bestvideo[height<=1080][ext=mp4]',
+                'outtmpl': f'{video_id}_video.%(ext)s',
+                'noplaylist': True,
+                'no_warnings': True,
+                'quiet': True,
+                'progress_hooks': [self.progress_hook],
+            }
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+
             self.video_path = os.path.join(os.getcwd(), f"{video_id}_video.mp4")
+
             self.progress_update.emit("Downloading thumbnail...")
             self.thumbnail_path = os.path.join(os.getcwd(), f"{video_id}_thumbnail.jpg")
             response = requests.get(thumbnail_url)
             with open(self.thumbnail_path, 'wb') as f:
                 f.write(response.content)
+
             self.download_complete.emit(self.video_path, self.thumbnail_path)
         except Exception as e:
             self.progress_update.emit(f"Error: {str(e)}")
+
+    def progress_hook(self, d):
+        if d['status'] == 'downloading':
+            percent = d['_percent_str']
+            speed = d['_speed_str']
+            eta = d['_eta_str']
+            self.progress_update.emit(f"Downloading: {percent} complete (Speed: {speed}, ETA: {eta})")
+        elif d['status'] == 'finished':
+            self.progress_update.emit("Download completed. Processing file...")
+
+    def extract_video_id(self, url):
+        patterns = [
+            r"(?:v=|\/)([0-9A-Za-z_-]{11}).*",
+            r"(?:youtu\.be\/|youtube\.com\/embed\/)([0-9A-Za-z_-]{11})",
+            r"^([0-9A-Za-z_-]{11})$"
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+
+        parsed_url = urlparse(url)
+        if parsed_url.netloc in ['youtube.com', 'www.youtube.com']:
+            query = parse_qs(parsed_url.query)
+            if 'v' in query:
+                return query['v'][0]
+        elif parsed_url.netloc == 'youtu.be':
+            return parsed_url.path.lstrip('/')
+        return None
+
 class VideoThumbnailMatcher(QThread):
     progress_update = pyqtSignal(int)
     result_ready = pyqtSignal(dict)
+
     def __init__(self, video_path, thumbnail_path, initial_skip_frames=30, min_skip_frames=5,
                  similarity_threshold=0.90, save_similar_threshold=0.40, resize_factor=0.25, debug=False):
         super().__init__()
@@ -87,12 +133,14 @@ class VideoThumbnailMatcher(QThread):
         self.debug_info = {}
         self.similar_frames = []
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
     def preprocess_image(self, image):
         image_resized = cv2.resize(image, (0, 0), fx=self.resize_factor, fy=self.resize_factor)
         gray = cv2.cvtColor(image_resized, cv2.COLOR_BGR2GRAY)
         hog_features = hog(gray, orientations=8, pixels_per_cell=(16, 16),
                            cells_per_block=(1, 1), visualize=False)
         return gray, hog_features
+
     def compare_images(self, img1, img1_hog, img2, img2_hog):
         ssim_score, _ = ssim(img1, img2, full=True)
         hog_similarity = 1 - cosine(img1_hog, img2_hog)
@@ -104,44 +152,58 @@ class VideoThumbnailMatcher(QThread):
                 'combined_score': combined_score
             }
         return combined_score
+
     def run(self):
         try:
             thumbnail = cv2.imread(self.thumbnail_path)
             if thumbnail is None:
                 raise ValueError(f"Could not load thumbnail from {self.thumbnail_path}")
+
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
                 raise ValueError(f"Could not open video file {self.video_path}")
+
             self.fps = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
             ret, first_frame = cap.read()
             if not ret:
                 raise ValueError("Could not read the first frame from the video.")
+
             self.frame_size = (first_frame.shape[1], first_frame.shape[0])
             thumbnail = cv2.resize(thumbnail, self.frame_size)
             thumbnail, thumbnail_hog = self.preprocess_image(thumbnail)
+
             skip_frames = self.initial_skip_frames
             frame_number = 0
+
             while frame_number < total_frames:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
                 ret, frame = cap.read()
                 if not ret:
                     frame_number += skip_frames
                     continue
+
                 processed_frame, processed_frame_hog = self.preprocess_image(frame)
                 similarity = self.compare_images(thumbnail, thumbnail_hog, processed_frame, processed_frame_hog)
+
                 if similarity > self.best_similarity:
                     self.best_similarity = similarity
                     self.best_frame_number = frame_number
                     self.best_frame = frame
+
                 if similarity > self.save_similar_threshold:
                     self.similar_frames.append((frame_number, similarity))
+
                 frame_number += skip_frames
                 self.progress_update.emit(int(frame_number / total_frames * 100))
+
             cap.release()
+
             best_frame_path = os.path.join(os.path.dirname(self.video_path), f"best_frame_{self.best_frame_number}.jpg")
             if self.best_frame is not None:
                 cv2.imwrite(best_frame_path, self.best_frame)
+
             self.result_ready.emit({
                 'best_frame': (self.best_frame_number, self.best_similarity, best_frame_path),
                 'similar_frames': self.similar_frames
@@ -180,23 +242,52 @@ class MainWindow(QMainWindow):
         # Dark mode
         self.dark_mode = False
         self.set_style()
-        main_layout = QVBoxLayout()
-        # YouTube URL input
-        url_layout = QHBoxLayout()
+        # Main layout
+        main_layout = QHBoxLayout()
+        # Left column (logs and controls)
+        left_column = QVBoxLayout()
+        left_column.addWidget(self.create_url_input())
+        left_column.addWidget(self.create_file_selection())
+        left_column.addWidget(self.create_start_button())
+        left_column.addWidget(self.create_progress_bar())
+        left_column.addWidget(self.create_result_text())
+        # Middle column (thumbnail and video player)
+        middle_column = QVBoxLayout()
+        middle_column.addWidget(self.create_thumbnail_preview())
+        # Right column (similar frames grid)
+        right_column = QVBoxLayout()
+        right_column.addWidget(self.create_similarity_controls())
+        right_column.addWidget(self.create_similar_frames_grid())
+        # Add columns to main layout
+        main_layout.addLayout(left_column, 1)  # Less width
+        main_layout.addLayout(middle_column, 2)
+        main_layout.addLayout(right_column, 2)
+        # Set central widget
+        central_widget = QWidget()
+        central_widget.setLayout(main_layout)
+        self.setCentralWidget(central_widget)
+        # Initialize other attributes
+        self.video_path = ""
+        self.thumbnail_path = ""
+        self.similarity_threshold = 0.90
+    def create_url_input(self):
+        url_widget = QWidget()
+        url_layout = QVBoxLayout(url_widget)
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("Enter YouTube URL")
         url_layout.addWidget(self.url_input)
-        self.fetch_button = QPushButton("Fetch Video and Thumbnail")
-        self.fetch_button.setIcon(QIcon('icons/download.png'))
-        self.fetch_button.clicked.connect(self.fetch_youtube_video)
-        url_layout.addWidget(self.fetch_button)
-        self.clear_button = QPushButton("Clear All")
-        self.clear_button.setIcon(QIcon('icons/clear.png'))
-        self.clear_button.clicked.connect(self.clear_all)
-        url_layout.addWidget(self.clear_button)
-        main_layout.addLayout(url_layout)
-        # File selection buttons
-        file_layout = QHBoxLayout()
+        fetch_button = QPushButton("Fetch Video and Thumbnail")
+        fetch_button.setIcon(QIcon('icons/download.png'))
+        fetch_button.clicked.connect(self.fetch_youtube_video)
+        url_layout.addWidget(fetch_button)
+        clear_button = QPushButton("Clear All")
+        clear_button.setIcon(QIcon('icons/clear.png'))
+        clear_button.clicked.connect(self.clear_all)
+        url_layout.addWidget(clear_button)
+        return url_widget
+    def create_file_selection(self):
+        file_widget = QWidget()
+        file_layout = QVBoxLayout(file_widget)
         self.video_button = QPushButton("Select Video")
         self.video_button.setIcon(QIcon('icons/video.png'))
         self.video_button.clicked.connect(self.select_video)
@@ -205,30 +296,27 @@ class MainWindow(QMainWindow):
         self.thumbnail_button.setIcon(QIcon('icons/image.png'))
         self.thumbnail_button.clicked.connect(self.select_thumbnail)
         file_layout.addWidget(self.thumbnail_button)
-        main_layout.addLayout(file_layout)
-        # Start processing button
+        return file_widget
+    def create_start_button(self):
         self.start_button = QPushButton("Start Processing")
         self.start_button.setIcon(QIcon('icons/play.png'))
         self.start_button.clicked.connect(self.start_processing)
-        main_layout.addWidget(self.start_button)
-        # Progress bar
+        return self.start_button
+    def create_progress_bar(self):
         self.progress_bar = QProgressBar()
-        main_layout.addWidget(self.progress_bar)
-        # Video player
-        self.video_player = QMediaPlayer(None, QMediaPlayer.VideoSurface)
-        self.video_widget = QVideoWidget()
-        main_layout.addWidget(self.video_widget)
-        self.video_player.setVideoOutput(self.video_widget)
-        # Playback controls
-        playback_layout = QHBoxLayout()
-        self.play_button = QPushButton("Play")
-        self.play_button.clicked.connect(self.play_pause_video)
-        playback_layout.addWidget(self.play_button)
-        self.seek_slider = QSlider(Qt.Horizontal)
-        self.seek_slider.sliderMoved.connect(self.set_position)
-        playback_layout.addWidget(self.seek_slider)
-        main_layout.addLayout(playback_layout)
-        # Similarity threshold slider
+        return self.progress_bar
+    def create_result_text(self):
+        self.result_text = QTextEdit()
+        self.result_text.setReadOnly(True)
+        return self.result_text
+    def create_thumbnail_preview(self):
+        self.thumbnail_preview = QLabel()
+        self.thumbnail_preview.setAlignment(Qt.AlignCenter)
+        self.thumbnail_preview.setFrameStyle(QFrame.Panel | QFrame.Sunken)
+        return self.thumbnail_preview
+    def create_similarity_controls(self):
+        similarity_widget = QWidget()
+        similarity_layout = QVBoxLayout(similarity_widget)
         threshold_layout = QHBoxLayout()
         threshold_layout.addWidget(QLabel("Similarity Threshold:"))
         self.threshold_slider = QSlider(Qt.Horizontal)
@@ -238,40 +326,22 @@ class MainWindow(QMainWindow):
         threshold_layout.addWidget(self.threshold_slider)
         self.threshold_label = QLabel("0.90")
         threshold_layout.addWidget(self.threshold_label)
-        main_layout.addLayout(threshold_layout)
-        # Similarity grouping dropdown
+        similarity_layout.addLayout(threshold_layout)
         grouping_layout = QHBoxLayout()
         grouping_layout.addWidget(QLabel("Group by similarity:"))
         self.grouping_combo = QComboBox()
         self.grouping_combo.addItems(["All", "More Similar", "Less Similar", "Not Good Similar"])
         self.grouping_combo.currentIndexChanged.connect(self.update_similar_frames_grid)
         grouping_layout.addWidget(self.grouping_combo)
-        main_layout.addLayout(grouping_layout)
-        # Splitter for result text and thumbnail preview
-        splitter = QSplitter(Qt.Horizontal)
-        # Result text
-        self.result_text = QTextEdit()
-        self.result_text.setReadOnly(True)
-        splitter.addWidget(self.result_text)
-        # Thumbnail preview
-        self.thumbnail_preview = QLabel()
-        self.thumbnail_preview.setAlignment(Qt.AlignCenter)
-        self.thumbnail_preview.setFrameStyle(QFrame.Panel | QFrame.Sunken)
-        splitter.addWidget(self.thumbnail_preview)
-        main_layout.addWidget(splitter)
-        # Similar frames grid
+        similarity_layout.addLayout(grouping_layout)
+        return similarity_widget
+    def create_similar_frames_grid(self):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.grid_widget = QWidget()
         self.grid_layout = QGridLayout(self.grid_widget)
         self.scroll_area.setWidget(self.grid_widget)
-        main_layout.addWidget(self.scroll_area)
-        container = QWidget()
-        container.setLayout(main_layout)
-        self.setCentralWidget(container)
-        self.video_path = ""
-        self.thumbnail_path = ""
-        self.similarity_threshold = 0.90
+        return self.scroll_area
     def create_menu_bar(self):
         menu_bar = QMenuBar(self)
         self.setMenuBar(menu_bar)
@@ -365,15 +435,6 @@ class MainWindow(QMainWindow):
     def toggle_dark_mode(self):
         self.dark_mode = not self.dark_mode
         self.set_style()
-    def play_pause_video(self):
-        if self.video_player.state() == QMediaPlayer.PlayingState:
-            self.video_player.pause()
-            self.play_button.setText("Play")
-        else:
-            self.video_player.play()
-            self.play_button.setText("Pause")
-    def set_position(self, position):
-        self.video_player.setPosition(position)
     def update_threshold(self, value):
         self.similarity_threshold = value / 100
         self.threshold_label.setText(f"{self.similarity_threshold:.2f}")
@@ -468,8 +529,8 @@ class MainWindow(QMainWindow):
         result_text += f"Best frame saved as: {best_frame_path}\n\n"
         result_text += "Similar frames for human verification:\n"
         # Set video for playback
-        self.video_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.video_path)))
-        self.seek_slider.setRange(0, self.video_player.duration())
+        # self.video_player.setMedia(QMediaContent(QUrl.fromLocalFile(self.video_path)))
+        # self.seek_slider.setRange(0, self.video_player.duration())
         self.update_similar_frames_grid()
         for frame_number, similarity in self.similar_frames:
             time = self.format_time(frame_number / self.matcher.fps)
@@ -614,7 +675,7 @@ class MainWindow(QMainWindow):
         # Clear thumbnail preview
         self.thumbnail_preview.clear()
         # Clear video player
-        self.video_player.setMedia(QMediaContent())
+        # self.video_player.setMedia(QMediaContent())
         # Clear similar frames grid
         for i in reversed(range(self.grid_layout.count())): 
             self.grid_layout.itemAt(i).widget().setParent(None)
